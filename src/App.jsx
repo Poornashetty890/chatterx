@@ -2,11 +2,6 @@ import React, { useState, useEffect, useRef } from "react";
 import io from "socket.io-client";
 import axios from "axios";
 
-/*
-  Configure these for your deployment:
-  - API_BASE: points to FastAPI (only used for register & fallback pull if needed)
-  - WS_BASE: points to Node.js server (exposed via Tailscale Funnel / public URL)
-*/
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
 const WS_BASE = import.meta.env.VITE_WS_BASE || "http://localhost:3000";
 
@@ -24,12 +19,18 @@ export default function App() {
     const socketRef = useRef(null);
     const typingTimeoutRef = useRef(null);
 
-    // Auto-scroll to bottom when new messages arrive
+    // For polling & dedupe
+    const pollIntervalRef = useRef(null);
+    const lastPulledIdRef = useRef(0);
+    const seenSetRef = useRef(new Set());
+
+    // Queue for messages sent while disconnected
+    const messageQueueRef = useRef([]);
+
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [messages]);
 
-    // Clear typing indicator
     useEffect(() => {
         if (isTyping) {
             if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
@@ -43,20 +44,40 @@ export default function App() {
     useEffect(() => {
         socketRef.current = io(WS_BASE, { autoConnect: false });
 
-        socketRef.current.on("connect", () => setConnected(true));
-        socketRef.current.on("disconnect", () => setConnected(false));
+        socketRef.current.on("connect", () => {
+            setConnected(true);
+            console.log("WebSocket connected");
+
+            // When reconnecting, pull missed messages
+            if (userId) {
+                pullMissedMessages();
+                // Retry queued messages
+                retryQueuedMessages();
+            }
+        });
+
+        socketRef.current.on("disconnect", () => {
+            setConnected(false);
+            console.log("WebSocket disconnected");
+        });
 
         socketRef.current.on("message", (message) => {
-            setMessages((prev) => [...prev, message]);
+            addMessages([message]);
         });
 
         socketRef.current.on("ack", (ack) => {
             console.log("Message acknowledged:", ack);
+            if (ack.status === "sent") {
+                // Mark message as delivered in UI if needed
+            }
         });
 
         socketRef.current.on("user_joined", (user) => {
-            setOnlineUsers(prev => [...prev, user]);
-            setMessages(prev => [...prev, {
+            setOnlineUsers(prev => {
+                if (prev.find(u => u.id === user.id)) return prev;
+                return [...prev, user];
+            });
+            addMessages([{
                 type: "system",
                 text: `${user.username} joined the chat`,
                 timestamp: Date.now()
@@ -65,7 +86,7 @@ export default function App() {
 
         socketRef.current.on("user_left", (user) => {
             setOnlineUsers(prev => prev.filter(u => u.id !== user.id));
-            setMessages(prev => [...prev, {
+            addMessages([{
                 type: "system",
                 text: `${user.username} left the chat`,
                 timestamp: Date.now()
@@ -73,14 +94,14 @@ export default function App() {
         });
 
         socketRef.current.on("user_typing", (data) => {
-            if (data.userId !== userId) {
+            if (data.userId !== String(userId)) {
                 setIsTyping(true);
                 setTypingUser(data.username);
             }
         });
 
         socketRef.current.on("user_stop_typing", (data) => {
-            if (data.userId !== userId) {
+            if (data.userId !== String(userId)) {
                 setIsTyping(false);
                 setTypingUser("");
             }
@@ -91,19 +112,121 @@ export default function App() {
         });
 
         return () => {
-            socketRef.current.disconnect();
+            try {
+                socketRef.current.disconnect();
+            } catch (e) { /* ignore */ }
             if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
         };
-    }, [userId]);
+    }, []);
+
+    // Polling only when disconnected
+    useEffect(() => {
+        if (pollIntervalRef.current) {
+            clearInterval(pollIntervalRef.current);
+            pollIntervalRef.current = null;
+        }
+
+        if (!userId) return;
+
+        // Only poll when WebSocket is disconnected
+        if (!connected) {
+            pollIntervalRef.current = setInterval(() => {
+                pullMissedMessages();
+            }, 3000);
+        }
+
+        return () => {
+            if (pollIntervalRef.current) {
+                clearInterval(pollIntervalRef.current);
+                pollIntervalRef.current = null;
+            }
+        };
+    }, [userId, connected]);
+
+    const pullMissedMessages = async () => {
+        try {
+            const res = await axios.get(`${API_BASE}/api/messages/pull`, {
+                params: { since_id: lastPulledIdRef.current || 0, limit: 100 }
+            });
+            const msgs = res?.data?.messages || [];
+            if (msgs.length > 0) {
+                let maxId = lastPulledIdRef.current || 0;
+                msgs.forEach(m => {
+                    if (m.id && m.id > maxId) maxId = m.id;
+                });
+                lastPulledIdRef.current = maxId;
+                addMessages(msgs);
+            }
+        } catch (err) {
+            console.error("poll error:", err?.message || err);
+        }
+    };
+
+    const retryQueuedMessages = () => {
+        if (messageQueueRef.current.length === 0) return;
+
+        console.log(`Retrying ${messageQueueRef.current.length} queued messages...`);
+
+        const queue = [...messageQueueRef.current];
+        messageQueueRef.current = [];
+
+        queue.forEach(payload => {
+            try {
+                socketRef.current.emit("send_message", payload);
+            } catch (err) {
+                console.error("Failed to retry message:", err);
+                // Re-queue if still failing
+                messageQueueRef.current.push(payload);
+            }
+        });
+    };
+
+    function addMessages(newMsgs) {
+        if (!Array.isArray(newMsgs)) newMsgs = [newMsgs];
+
+        setMessages((prev) => {
+            const out = [...prev];
+            const seen = seenSetRef.current;
+
+            newMsgs.forEach((m) => {
+                let key = null;
+                if (m.id) {
+                    key = `id:${m.id}`;
+                } else {
+                    const ts = m.timestamp ? String(m.timestamp) : "no-ts";
+                    const sender = (m.sender_id !== undefined && m.sender_id !== null) ? String(m.sender_id) : (m.username || "anon");
+                    const txt = m.text ? String(m.text) : "";
+                    key = `sig:${sender}:${ts}:${txt}`;
+                }
+
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    out.push(m);
+                }
+            });
+
+            out.sort((a, b) => {
+                const ta = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+                const tb = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+                return ta - tb;
+            });
+
+            if (out.length > 2000) {
+                out.splice(0, out.length - 2000);
+            }
+
+            return out;
+        });
+    }
 
     const handleTyping = () => {
-        if (socketRef.current && userId) {
+        if (socketRef.current && userId && connected) {
             socketRef.current.emit("typing", { userId, username });
         }
     };
 
     const handleStopTyping = () => {
-        if (socketRef.current && userId) {
+        if (socketRef.current && userId && connected) {
             socketRef.current.emit("stop_typing", { userId, username });
         }
     };
@@ -117,14 +240,24 @@ export default function App() {
             });
 
             setUserId(response.data.id);
+
             socketRef.current.auth = { userId: response.data.id };
             socketRef.current.connect();
             socketRef.current.emit("auth", { userId: response.data.id, username: username.trim() });
 
-            // Load message history
-            const historyResponse = await axios.get(`${API_BASE}/api/messages/pull`);
-            if (historyResponse.data?.messages) {
-                setMessages(historyResponse.data.messages);
+            // Load initial history
+            try {
+                const historyResponse = await axios.get(`${API_BASE}/api/messages/pull`);
+                if (historyResponse.data?.messages) {
+                    let maxId = lastPulledIdRef.current || 0;
+                    historyResponse.data.messages.forEach(m => {
+                        if (m.id && m.id > maxId) maxId = m.id;
+                    });
+                    lastPulledIdRef.current = maxId;
+                    addMessages(historyResponse.data.messages);
+                }
+            } catch (err) {
+                console.warn("initial history pull failed:", err?.message || err);
             }
 
         } catch (error) {
@@ -145,7 +278,29 @@ export default function App() {
             timestamp: Date.now()
         };
 
-        socketRef.current.emit("send_message", payload);
+        // Optimistically add to UI immediately
+        addMessages([{
+            sender_id: userId,
+            text: payload.text,
+            username: username,
+            timestamp: payload.timestamp,
+            status: connected ? 'sending' : 'queued'
+        }]);
+
+        if (!connected || !socketRef.current?.connected) {
+            // Queue message for later
+            messageQueueRef.current.push(payload);
+            console.log("Message queued - will send when reconnected");
+        } else {
+            try {
+                socketRef.current.emit("send_message", payload);
+            } catch (err) {
+                console.error("send error:", err);
+                // Queue it if send fails
+                messageQueueRef.current.push(payload);
+            }
+        }
+
         setText("");
         handleStopTyping();
     }
@@ -158,7 +313,7 @@ export default function App() {
     };
 
     const formatTime = (timestamp) => {
-        return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return timestamp ? new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "";
     };
 
     const isOwnMessage = (message) => {
@@ -187,13 +342,17 @@ export default function App() {
                     </div>
                 ) : (
                     <div className="chat-interface">
-                        {/* Header */}
                         <div className="chat-header">
                             <div className="header-left">
                                 <h2>💬 Simple Chat</h2>
                                 <div className="connection-status">
                                     <div className={`status-dot ${connected ? 'connected' : 'disconnected'}`}></div>
                                     {connected ? 'Connected' : 'Disconnected'}
+                                    {messageQueueRef.current.length > 0 && (
+                                        <span style={{ marginLeft: '10px', fontSize: '12px', color: '#ff6b6b' }}>
+                                            ({messageQueueRef.current.length} queued)
+                                        </span>
+                                    )}
                                 </div>
                             </div>
                             <div className="header-right">
@@ -205,7 +364,6 @@ export default function App() {
                         </div>
 
                         <div className="chat-body">
-                            {/* Online Users Sidebar */}
                             <div className="sidebar">
                                 <h3>Online Users ({onlineUsers.length})</h3>
                                 <div className="users-list">
@@ -224,9 +382,7 @@ export default function App() {
                                 </div>
                             </div>
 
-                            {/* Main Chat Area */}
                             <div className="main-chat">
-                                {/* Messages Container */}
                                 <div className="messages-container">
                                     {messages.map((message, index) => (
                                         <div
@@ -246,6 +402,11 @@ export default function App() {
                                             )}
                                             <div className="message-content">
                                                 {message.text}
+                                                {message.status === 'queued' && (
+                                                    <span style={{ fontSize: '11px', marginLeft: '8px', opacity: 0.6 }}>
+                                                        ⏱ Queued
+                                                    </span>
+                                                )}
                                             </div>
                                             <div className="message-time">
                                                 {formatTime(message.timestamp)}
@@ -266,7 +427,6 @@ export default function App() {
                                     <div ref={messagesEndRef} />
                                 </div>
 
-                                {/* Input Area */}
                                 <div className="input-container">
                                     <div className="recipient-selector">
                                         <input
