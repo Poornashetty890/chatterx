@@ -2,6 +2,7 @@
   "name": "chat-frontend",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "homepage": "https://Poornashetty890.github.io/AKP",
   "scripts": {
     "dev": "vite",
@@ -14,7 +15,14 @@
     "axios": "^1.4.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "socket.io-client": "^4.8.0"
+    "socket.io-client": "^4.8.0",
+    "framer-motion": "^11.0.0",
+    "lucide-react": "^0.378.0",
+    "tailwindcss": "^3.4.10",
+    "postcss": "^8.4.35",
+    "autoprefixer": "^10.4.20",
+    "@headlessui/react": "^1.7.18",
+    "clsx": "^2.1.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.1.1",
