@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "homepage": "https://Poornashetty890.github.io/AKP",
+  "homepage": "https://poornashetty890.github.io/chatterx",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
